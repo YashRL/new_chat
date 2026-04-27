@@ -1,0 +1,8 @@
+uvicorn api:app --host localhost --port 8083 --reload
+
+http://localhost:8083/static/index.html
+
+python scripts/make_admin.py username // for making any user admin
+
+
+

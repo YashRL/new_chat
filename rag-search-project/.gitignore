@@ -1,0 +1,70 @@
+# Environment variables (contains secrets!)
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+develop-eggs/
+.installed.cfg
+lib/
+lib64/
+
+# Virtual environment
+.venv/
+venv/
+env/
+ENV/
+
+# Uploaded PDFs (temporary staging)
+uploaded_pdfs/
+
+# OCR cache files
+**/ocr/
+
+# Database backups
+backups/
+
+# Logs
+*.log
+logs/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# pytest
+.pytest_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+
+# Drawio diagrams (optional: remove if you want to track them)
+*.drawio
+*.drawio.drawio
+
+# Legacy code
+legacy/
+
+# Static files (if generated, not hand-written)
+# static/

@@ -1,0 +1,344 @@
+# RAG System — Full Production Upgrade Plan
+
+## Executive Summary
+
+After a deep end-to-end audit of the codebase, I found a system that is **architecturally sound in its foundations** but has **significant gaps in critical RAG-specific areas** that prevent it from being truly production-grade. The ingestion pipeline, hybrid search, and scoring engine are well-thought-out. However, the LLM/generation layer is essentially **missing entirely** — there is no RAG answer generation, no grounding, no citation assembly, and no hallucination prevention. Other issues span reliability, security, observability, and evaluation coverage.
+
+---
+
+## Repository Assessment
+
+### What the system does well ✅
+- **Parent-child chunking**: Good semantic hierarchy preserving context.
+- **Hybrid search (semantic + lexical + keyword)**: Well-structured with configurable weight profiles.
+- **Two-stage scoring**: Fair document-level ranking with size fairness correction.
+- **HyDE support**: Optional hypothetical document embedding for better recall.
+- **Cross-encoder reranking**: NVIDIA reranker integrated (but disabled by default).
+- **Diversity enforcement**: Per-doc and per-section chunk caps prevent monopolization.
+- **OCR pipeline**: Parallel page processing with confidence tracking.
+- **Migration system**: Checksum-based schema migrations — solid pattern.
+- **Auth middleware**: JWT-based with role awareness.
+- **Async job queue**: Background ingestion via `process_document_async`.
+
+### What is broken or missing ❌
+
+---
+
+## Issues — Priority Ranked
+
+### 🔴 CRITICAL (P0) — Highest Impact
+
+#### 1. No RAG Generation Layer
+The system can **retrieve** but cannot **answer**. There is no endpoint that takes a query, retrieves context, assembles a prompt, calls an LLM, and returns a grounded answer with citations. The `chat/chat.py` module only stores messages — it never calls the search engine. This is the most glaring gap in a system called a "RAG search project."
+
+**Impact**: Core RAG functionality missing. Users get raw chunks, not answers.
+
+#### 2. `_token_cache` is an Unbounded In-Memory Leak
+In `ingest/ingest.py` line 64-69, `_token_cache: Dict[str, List[int]] = {}` grows without a bound per-process. While it's `.clear()`d in `finally`, during a large PDF ingest it can hold hundreds of MBs of token arrays in memory simultaneously.
+
+**Impact**: OOM crashes on large document ingestion.
+
+#### 3. Job Status is Ephemeral In-Memory Dict
+`jobs/processor.py` uses `job_status: Dict[str, Dict]` — a plain Python dict. On server restart, all job statuses are lost. This is a silent reliability hole for async ingestion.
+
+**Impact**: Users polling job status after restart get 404. Completed jobs leave no audit trail.
+
+#### 4. Secret Key Is Exposed in `.env.example`
+The `.env.example` contains real production values: `NVIDIA_API_KEY`, `SECRET_KEY`, and `PGPASSWORD`. This is a credential leak waiting to happen.
+
+**Impact**: Security breach if repo is shared or made public.
+
+#### 5. CORS Allows All Origins
+`allow_origins=["*"]` with `allow_credentials=True`. The `Access-Control-Allow-Origin: *` header and `Access-Control-Allow-Credentials: true` are mutually exclusive in browsers — this is actually a CORS misconfiguration that silently breaks credential requests in some browsers and is a security risk in production.
+
+**Impact**: Security vulnerability + potential credential-based CORS failures.
+
+---
+
+### 🟠 HIGH (P1) — Major Feature Gaps
+
+#### 6. No Query Decomposition / Multi-Query Retrieval
+Complex questions like "Compare the efficiency of quicksort versus mergesort and explain when each is preferred" cannot be answered by a single vector query. There is no query expansion, sub-query splitting, or multi-query retrieval fusion.
+
+**Impact**: Poor recall on compound and comparative questions.
+
+#### 7. No Context Assembly / Prompt Builder
+There is no module that takes retrieved chunks, de-duplicates them, orders them by source, applies token budgets, and builds a clean prompt for an LLM. The raw `results` list from `hybrid_search` is returned to the caller as-is, with zero prompt engineering.
+
+**Impact**: Even if an LLM were called, the context would be unstructured and potentially hallucination-inducing.
+
+#### 8. No Conversational Memory Integration with Search
+Chat sessions exist in the DB but the search engine is never called when a user sends a message in a session. There is no history augmentation of the query (e.g., HyDE-style contextual compression, conversation history injection, or session-scoped retrieval).
+
+**Impact**: Multi-turn conversations are stateless — every question starts from scratch.
+
+#### 9. Chunking Has No Sliding-Window Overlap Between Paragraphs
+`chunk_paragraphs()` exists with overlap logic (lines 142-151 in `ingest.py`), but `make_parent_child_chunks()` — which is the actual function used for all ingestion — does NOT use this. Children are contiguous, non-overlapping. Information that spans a boundary between two child chunks will be lost during retrieval.
+
+**Impact**: Retrieval misses context that straddles chunk boundaries — a known RAG quality issue.
+
+#### 10. No Document Versioning / Reindexing Flow
+While the schema has `version_of` and `canonical_doc_id` columns, there is no API to replace an existing document with a new version. The only option is delete + re-upload. There is no diff-based reindexing.
+
+**Impact**: Knowledge base cannot be updated cleanly without full re-upload.
+
+#### 11. `embed_query` Cache is Process-Scoped with `lru_cache`
+`lru_cache(maxsize=1000)` on `embed_query` in `search.py` means query embeddings are re-computed on every server restart and are not shared across workers. In a multi-worker Uvicorn deployment, each worker has its own separate cache.
+
+**Impact**: Wasted embedding API calls and latency under load.
+
+---
+
+### 🟡 MEDIUM (P2) — Quality and Reliability Issues
+
+#### 12. `insert_chunk` Uses a Unique Index Conflict But Not `ON CONFLICT`
+`insert_chunk` in `ingest.py` does a `SELECT` then `INSERT` — a classic TOCTOU race. If two workers try to insert the same chunk hash simultaneously (e.g., two async jobs), one will fail with a unique constraint violation.
+
+**Impact**: Rare race condition causing failed ingestion under concurrent load.
+
+#### 13. File Cleanup Deletes the Uploaded PDF Before the App is Done
+In `ingest.py` `finally` block (line 590-594): `os.remove(file_path)` unconditionally deletes the uploaded PDF. If the `ingest()` function is called from `process_document_async`, the file is always deleted after ingestion. However, the function makes no distinction between async mode (where the file should be deleted) and a hypothetical direct call where the caller might still need the file.
+
+**Impact**: Minor but fragile — tightly coupled cleanup logic.
+
+#### 14. `run_query` Silently Swallows Non-Query Errors
+In `db.py` line 87-93:
+```python
+def run_query(query, params=None):
+    with get_db_cursor() as cur:
+        cur.execute(query, params)
+        try:
+            return cur.fetchall()
+        except Exception:
+            return []
+```
+If `fetchall()` raises (e.g., network drop mid-result), it silently returns `[]`. But the outer `with get_db_cursor()` would still trigger rollback. This is subtle — DML statements run with `run_query` that shouldn't be `SELECT` (e.g., line 1003-1007 in `api.py`: `run_query` used for an `UPDATE`) will execute the mutation but the result check is swallowed.
+
+**Impact**: Mutations executed via `run_query` (e.g., expiry update) have silent failure modes.
+
+#### 15. Health Check is Trivial — No DB or Embedding Liveness Check
+`GET /health` returns `{"status": "healthy"}` unconditionally — it never checks if the DB connection pool is alive or whether the embedding API is reachable.
+
+**Impact**: Load balancers cannot detect unhealthy instances. Kubernetes readiness probes will give false positives.
+
+#### 16. No Rate Limiting on Search or Ingest Endpoints
+Any authenticated user can hammer `/search` or `/ingest` without any throttling. Search triggers an embedding API call per query. Mass search could exhaust the NVIDIA API quota.
+
+**Impact**: API quota exhaustion, cost blowout, DoS risk.
+
+#### 17. `_simulate_selection` is Defined Twice in `test_fairness.py`
+`test_fairness.py` defines `_simulate_selection()` at lines 243 and 402 — identical code. The second definition silently shadows the first due to Python's top-level execution order. The tests calling the first definition (lines 272-313) actually run the second (lines 402-423). This is a latent test maintenance trap.
+
+**Impact**: Test code quality issue; introduces silent inconsistency risk.
+
+#### 18. No Text Normalization Beyond Whitespace Cleaning
+`clean_text()` only strips control chars and collapses whitespace. There's no Unicode normalization (NFKC), no ligature expansion (ﬁ→fi), no hyphenation fixing, no footers/headers stripping. PDFs commonly contain these artifacts.
+
+**Impact**: Token fragmentation reduces embedding quality, especially for academic/scanned PDFs.
+
+#### 19. No Observability / Structured Logging
+`logging.basicConfig(level=logging.INFO)` in `api.py`. No structured JSON logging, no request IDs for correlation, no latency tracking per endpoint, no embedding call tracking. Debugging a production issue under load would require log grep archaeology.
+
+**Impact**: Operational blindness in production.
+
+#### 20. Connection Pool Size (maxconn=10) Is Too Small for Production
+The pool is `ThreadedConnectionPool(minconn=2, maxconn=10)`. With 4 Uvicorn workers × concurrent requests, this is exhausted quickly, causing `PoolError: connection pool exhausted`.
+
+**Impact**: Service degradation under moderate load.
+
+---
+
+### 🔵 LOW (P3) — Polish and Maintainability
+
+#### 21. `cron/cron_jobs.py` Not Inspected — Likely Important
+The cron module is imported and `run_cron()` is called on startup but its code wasn't in the initial listing.
+
+#### 22. Missing `__init__.py` in Several Packages
+`content_extraction/`, `ingest/`, `assesments/` have no `__init__.py` — they're implicit namespace packages. This works in Python 3.3+ but reduces IDE support and import clarity.
+
+#### 23. Duplicate `python-jose` and `PyJWT` in requirements
+Both JWT libraries are listed. The code uses `PyJWT` (`import jwt`). `python-jose` is unused and conflicts on Python 3.12+.
+
+#### 24. `DEBUG` print statements in production code
+`data_extractor.py` line 181: `print(f"DEBUG: Found {len(toc)} TOC entries...")` — raw print debugging in production ingestion code.
+
+#### 25. No API versioning (`/v1/...`)
+All routes are unversioned. Adding `/v1/` prefix is a breaking change later.
+
+---
+
+## Proposed Changes (Phased)
+
+---
+
+### Phase 1 — Security & Stability (Pre-everything) ✅ Must-fix first
+
+#### [MODIFY] `.env.example`
+- Remove all real secrets (API key, JWT secret, DB password)
+- Replace with clear placeholder values
+
+#### [MODIFY] `api.py`
+- Fix CORS misconfiguration: replace `allow_origins=["*"]` with env-configured origins list
+- Add rate limiting via `slowapi` for `/search` and `/ingest`
+- Upgrade health check to verify DB pool + embedding API liveness
+
+#### [MODIFY] `db/db.py`
+- Increase pool maxconn to 20 (or make it env-configurable)
+- Fix `run_query` to not swallow DML results silently — add a separate `execute_dml` helper
+
+---
+
+### Phase 2 — RAG Generation Layer (Core missing feature)
+
+#### [NEW] `rag/generator.py`
+- `assemble_context(chunks, max_tokens, overlap_strategy)` — builds grounded context from retrieved chunks with token budget management
+- `build_rag_prompt(query, context, history, system_prompt)` — structured prompt builder with citation markers
+- `generate_answer(query, context, model, stream)` — calls NVIDIA LLM with assembled context, returns answer + citations
+- `extract_citations(chunks)` — maps `[1]`, `[2]`... to source documents/pages
+
+#### [NEW] `rag/query_rewriter.py`
+- `decompose_query(query)` → List[str] — splits compound questions into sub-queries using LLM
+- `expand_query(query)` → str — generates alternative phrasings for better recall
+- `contextualize_query(query, history)` → str — incorporates conversation history into standalone query
+
+#### [NEW] `api.py` endpoint: `POST /answer`
+- Accepts `query`, `session_id`, `filters`, `top_k`
+- Runs retrieval (with optional query rewriting)
+- Assembles context with `assemble_context()`
+- Calls `generate_answer()` streaming or non-streaming
+- Saves assistant message to `chat_messages`
+- Returns: `answer`, `citations`, `sources`, `retrieval_metadata`
+
+---
+
+### Phase 3 — Retrieval Quality Improvements
+
+#### [MODIFY] `ingest/ingest.py`
+- Replace `_token_cache` dict with `functools.lru_cache` with `maxsize=512` to auto-evict
+- Add sliding-window overlap to `make_parent_child_chunks()` children
+- Add Unicode NFKC normalization and ligature fixing in `clean_text()`
+- Fix `insert_chunk` to use `INSERT ... ON CONFLICT DO NOTHING` instead of SELECT-then-INSERT
+- Strip common PDF artifacts: page numbers, running headers/footers
+
+#### [MODIFY] `search_engine/search.py`
+- Add `multi_query_search(queries, top_k, ...)` — runs parallel searches and RRF-fuses results
+- Add `contextual_search(query, history, ...)` — rewrites query using session history before searching
+- Move `embed_query` cache to Redis (or keep lru_cache but document the multi-worker limitation)
+- Make `MAX_CHUNKS_PER_DOC` and `MAX_CHUNKS_PER_SECTION` configurable per-call (not global constants)
+
+#### [MODIFY] `content_extraction/data_extractor.py`
+- Remove `print(f"DEBUG: ...")` statements, replace with `logger.debug()`
+- Add support for DOCX/TXT file types (not just PDF)
+
+---
+
+### Phase 4 — Conversational Memory
+
+#### [MODIFY] `chat/chat.py`
+- Add `POST /chat/sessions/{session_id}/ask` endpoint
+- On message receipt: retrieve history → contextualize query → search → generate → store answer
+- Add `GET /chat/sessions/{session_id}/context` — returns current session's document context
+
+---
+
+### Phase 5 — Observability & Operations
+
+#### [NEW] `core/logging.py`
+- Structured JSON logging with request ID injection
+- Per-request timing middleware
+- Embedding API call counter
+
+#### [MODIFY] `jobs/processor.py`
+- Persist job status to DB (`ingestion_jobs` table) — survive restarts
+- Add job cleanup cron
+
+#### [MODIFY] `tests/test_fairness.py`
+- Remove duplicate `_simulate_selection` definition
+- Add `conftest.py` with shared fixtures
+
+#### [NEW] `tests/test_ingestion.py`
+- Unit tests for `clean_text`, `chunk_paragraphs`, `make_parent_child_chunks`
+- Test edge cases: empty PDF, single-page, massive token count
+
+#### [NEW] `tests/test_search_integration.py`
+- Mock DB responses to test `hybrid_search` scoring logic end-to-end
+
+#### [NEW] `tests/test_rag_generation.py`
+- Test `assemble_context` token budgeting
+- Test `extract_citations` correctness
+- Test prompt building
+
+---
+
+### Phase 6 — Packaging & Configuration
+
+#### [MODIFY] `requirements.txt`
+- Remove `python-jose` (unused, conflicts with PyJWT)
+- Pin all critical dependencies with version ranges
+- Add `slowapi`, `redis` (optional), `structlog`
+
+#### [MODIFY] `.env.example`
+- Add all new configuration variables with documentation
+- Add `LLM_MODEL`, `LLM_MAX_TOKENS`, `ANSWER_STREAM`, `RATE_LIMIT_SEARCH`, `ALLOWED_ORIGINS`
+
+#### [NEW] `README.md` (full rewrite)
+- End-to-end setup guide
+- Architecture diagram description
+- API reference summary
+- Environment variable reference
+
+---
+
+## Verification Plan
+
+### After Phase 1
+- Run server and verify `allow_credentials=True` with specific origin works
+- Verify health check returns 503 when DB is down
+
+### After Phase 2
+- Test `/answer` endpoint with sample question against ingested document
+- Verify citations point to correct source chunks
+- Test streaming response
+
+### After Phase 3
+- Run `pytest tests/test_ingestion.py` — all pass
+- Ingest a 500-page PDF and verify no OOM, correct chunk count
+- Query for information that spans a chunk boundary — verify retrieved
+
+### After Phase 4
+- Multi-turn conversation test: ask follow-up "Who wrote it?" after "What is RAG?" — verify contextual answer
+
+### After Phase 5
+- Run full pytest suite
+- Load test with 50 concurrent search requests — verify pool doesn't exhaust
+
+---
+
+## Technical Debt Remaining After These Phases
+
+1. **No DOCX/TXT ingestion** — still PDF-only after Phase 3 (can extend later)
+2. **No knowledge graph / entity extraction** — pure chunk-based, no graph RAG
+3. **No feedback loop / RLHF** — no thumbs up/down collection
+4. **No evaluation framework** (RAGAS-style) — no automated precision/recall tracking
+5. **Redis cache for embeddings** — optional, documented but not wired up
+6. **API versioning** — still no `/v1/` prefix
+
+---
+
+## User Review Required
+
+> [!IMPORTANT]
+> **Phase 2 (RAG Generation) requires an LLM choice.**
+> The codebase already uses NVIDIA NIM for embeddings. The generation LLM can be:
+> - `meta/llama-3.1-70b-instruct` (NVIDIA NIM, same API key as embeddings)
+> - `gpt-4.1` or `gpt-4o` (OpenAI — requires a separate key)
+> - Any OpenAI-compatible endpoint
+>
+> **Which LLM should power the answer generation?** The system will work with any OpenAI-compatible API, but the optimal choice depends on your existing API access.
+
+> [!WARNING]
+> **Phase 5 changes job status persistence to the DB.**
+> This requires a new migration (`ingestion_jobs` table). Existing in-flight job IDs from before the migration will be lost.
+
+> [!CAUTION]
+> **The `.env.example` currently contains real credentials** (NVIDIA API key, JWT secret key, Postgres password). I will replace them with placeholders in Phase 1. You should also rotate these credentials if the file has ever been committed to a public or shared repository.

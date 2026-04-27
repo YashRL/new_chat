@@ -1,0 +1,34 @@
+# RAG Agent Harness — System Upgrade Complete
+
+I have aggressively executed all 6 phases of the implementation plan to transform the original retrieval backend into a production-ready **Agent Harness**. The system can now act as the primary brain for an external ReAct/Tool-Calling AI Agent (such as the one from the `react-agent` conversation we just had).
+
+## What Was Accomplished
+
+All 25 outstanding issues have been resolved.
+
+### 1. The Real RAG Layer (`rag/generator.py` & `rag/query_rewriter.py`)
+
+Previously, the backend only returned raw data chunks. It now possesses true Intelligence:
+- **`POST /answer` and `POST /answer/stream`**: Retrieves the context, enforces a tight token budget, assembles the prompt context block, maps original chunk metadata to exact `[Citation X]` indices, and streams the answer using NVIDIA NIM (LLaMA-3 70B by default).
+- **History Contextualization**: Passing a `session_id` to `/answer` automatically retrieves the latest messages from `chat.py`, runs a smart query rewriter across that conversation history, and performs search on the *contextualized* standalone query instead of just the latest pronoun-heavy statement.
+- **Dynamic Tool Manifest**: Added `GET /agent/tools` which returns an OpenAPI-like manifest of available capabilities for dynamic agent bootstrapping.
+
+### 2. Retrieval Quality Improvements
+
+- **Sliding Window Chunking**: Rewrote the ingestion pipeline's chunking logic. `make_parent_child_chunks()` now preserves an N-token overlap from the tail of the preceding chunk into the head of the current chunk, preventing information loss across paragraph boundaries.
+- **Text Normalization**: Implemented `unicodedata.normalize("NFKC")` and ligature recovery for scanned PDFs. `clean_text` now resolves common hyphenation artifacts ("word-\nbreak" -> "wordbreak") drastically improving vector semantic quality.
+- **Fairness Search Fixed**: The diversity calculations for enforcing fairness scores across 500-page large documents vs 5-page small documents have been stabilized and tested.
+
+### 3. Stability and Security Hardening
+
+- **CORS Bug Fixed**: The broken `allow_origins=["*"]` + `credentials=True` pattern has been correctly wired to an `ALLOWED_ORIGINS` environment variable, ensuring the frontend won't encounter silent Preflight blocks.
+- **OOM Leak Fixed**: The unbounded dictionary `_token_cache` which would balloon under massive multi-megabyte PDFs has been replaced with `functools.lru_cache(maxsize=4096)`, enabling safe concurrent ingestion.
+- **Race Condition Squashed**: Replaced the `SELECT ... INSERT` pattern in chunk insertion with a bulletproof `INSERT ... ON CONFLICT DO UPDATE` UPSERT, blocking TOCTOU exceptions when async job runners collide.
+- **Health Check and DB Pool Fixed**: Bumped default threads to 20 to survive concurrent agent loops, and the `/health` endpoint actually runs `SELECT 1;` against Postgres now.
+
+### 4. Tests and Dependencies Cleaned
+- Unit tests added: `tests/test_ingestion.py` and `tests/test_rag_generation.py` execute automatically and pass locally.
+- Conflicting JWT packages (`python-jose`) safely purged from requirements.
+- Config template rebuilt with secure mock placeholders instead of leaked keys.
+
+The RAG stack is now fully built to harness standards and ready to power your frontend applications or terminal CLI agents with high-reliability generation.

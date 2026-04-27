@@ -1,0 +1,62 @@
+# ---- Environment ----
+
+.env
+.env.*
+!.env.example
+
+# ---- Python ----
+
+**pycache**/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+*.whl
+
+# ---- Virtual Environments ----
+
+.venv/
+venv/
+env/
+ENV/
+
+# ---- Testing / Coverage ----
+
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# ---- Build / Distribution ----
+
+build/
+dist/
+*.log
+
+# ---- Project-specific (sqlite-vec build artifacts) ----
+
+dist/
+*.so
+
+# ---- Logs / Backups ----
+
+logs/
+*.log
+backups/
+
+# ---- IDE / OS ----
+
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ---- Misc ----
+
+*.sqlite
+*.db
+*.db-journal
+.env
+text

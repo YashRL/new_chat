@@ -1,0 +1,68 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  "model": "sap-proxy/sap-deployed-model",
+
+  "provider": {
+    "sap-proxy": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "SAP Proxy",
+      "options": {
+        "baseURL": "http://127.0.0.1:8081/v1",
+        "apiKey": "local-test-key"
+      },
+      "models": {
+        "sap-deployed-model": {
+          "name": "SAP Deployed Model",
+          "limit": {
+            "context": 80000,
+            "output": 16000
+          }
+        }
+      }
+    }
+  },
+
+  "mcp": {
+    "codebase-memory-mcp": {
+      "enabled": true,
+      "type": "local",
+      "command": ["/home/moy/.local/bin/codebase-memory-mcp"]
+    },
+    "context7": {
+      "enabled": true,
+      "type": "remote",
+      "url": "https://mcp.context7.com/mcp"
+    },
+    "tavily": {
+      "enabled": true,
+      "type": "local",
+      "command": ["npx", "-y", "tavily-mcp"]
+    },
+    "playwright": {
+      "enabled": true,
+      "type": "local",
+      "command": ["node", "/home/moy/.npm-global/lib/node_modules/@playwright/mcp/cli.js"]
+    },
+    "task-master": {
+      "enabled": true,
+      "type": "local",
+      "command": ["npx", "-y", "task-master-ai"]
+    }
+  },
+
+  "permission": {
+    "bash": "ask",
+    "edit": "ask",
+    "read": "allow",
+    "grep": "allow",
+    "glob": "allow",
+    "list": "allow",
+    "lsp": "ask",
+    "skill": "allow",
+    "todowrite": "allow",
+    "webfetch": "allow",
+    "websearch": "allow",
+    "question": "allow"
+  }
+}
